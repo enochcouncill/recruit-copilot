@@ -43,6 +43,17 @@ EXAMPLE_SEARCH = {
     "locations": ["remote", "united states"],
     "keywords_bonus": ["ai", "ml", "llm", "platform"],
     "min_match": 55,
+    # Who you are, which is what decides whether a role you WANT is a role you
+    # could GET. Without it the scout will happily put a VP job you cannot land
+    # above the manager job you can. See dashboard/qualification.py.
+    "profile": {
+        "years_experience": 8,
+        "education": "BS Computer Science",
+        # Title words that sit above you. Leave it out to take the default list
+        # (director, vp, head of, principal, staff, chief, partner, ...), or set
+        # it to [] if none of them are a reach for you.
+        "level_ceiling": ["vp", "vice president", "chief", "head of", "distinguished"],
+    },
 }
 EXAMPLE_GOALS = [
     {"goal": "Replace the hardcoded example with the titles you actually want",
@@ -155,6 +166,14 @@ def load(state_dir: str) -> dict:
     merged.update(search)
     merged["titles"] = {**EXAMPLE_SEARCH["titles"], **search.get("titles", {})}
     merged["seniority"] = {**EXAMPLE_SEARCH["seniority"], **search.get("seniority", {})}
+    # `profile` is deliberately NOT merged onto the example. Every other key in
+    # here is a preference, and inheriting a stranger's preference only shows you
+    # the wrong jobs. `profile` is a claim about WHO THE USER IS -- inheriting
+    # "8 years of experience" from the example would tell a career changer they
+    # are qualified for roles they are not, in the tool's own confident voice.
+    # A missing profile disables the years and level checks; the bank-driven
+    # checks still run, because those read only what the user confirmed.
+    merged["profile"] = dict(search.get("profile") or {})
     return merged
 
 

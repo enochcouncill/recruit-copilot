@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
 """job_scout - ingest roles from public ATS JSON endpoints (Greenhouse boards-api +
-Ashby posting-api, both public, no auth, ToS-clean), score them, select the top N
-per company, and capture the JD text for the selected roles. Writes
-state/jobs.json, which the Jobs tab reads.
+Ashby posting-api, both public, no auth, ToS-clean), score them against your goals,
+check whether you could actually GET them, select the top N per company, and capture
+the JD text. Writes state/jobs.json, which the Jobs tab reads.
+
+Two questions, two scorers. search_goals.py answers "is this the kind of role I
+want?" from the title, level, location and pay. qualification.py answers "could I
+get it?" from the posting's stated requirements and your own experience bank. The
+first one alone put a Corporate Development LEAD at $425-600k and a PRINCIPAL
+Product Manager at the top of a second-year MBA's list, which is a ranked list
+that spends attention on the applications least likely to land.
 
 Edit <workspace>/state/target_companies.json to set YOUR target boards (each row is
 {name, ats: greenhouse|ashby, token}) and criteria. Run: python3 job_scout.py
 """
-import argparse, html, json, os, re, sys, urllib.request
+import argparse, html, json, os, re, sys, time, urllib.request
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import paths
+import qualification
 import search_goals
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -24,6 +32,16 @@ HOME = paths.home(create=True)
 STATE = os.path.join(HOME, "state")
 CFG = os.path.join(STATE, "target_companies.json")
 JOBS_OUT = os.path.join(STATE, "jobs.json")
+MASTER = os.path.join(HOME, "master-experience.json")
+
+# One board that hangs should not cost the whole run, and one board that hangs
+# ONCE is usually just a slow board. Anduril's answers in ~3s or not at all.
+DEFAULT_TIMEOUT = 30
+# How many roles per company get their posting body fetched and qualification-
+# checked. The qualification pass needs the JD, and the JD costs a request, so
+# this is the knob that trades run time for how deep the honest ranking goes.
+CANDIDATE_MULTIPLE = 2
+CANDIDATE_CAP = 12
 
 DEFAULT_COMPANIES = [
     {"name": "Anthropic", "ats": "greenhouse", "token": "anthropic"},
@@ -37,10 +55,25 @@ DEFAULT_COMPANIES = [
 # Scoring comes from YOUR goals file, not from constants in here. See
 # dashboard/search_goals.py for why that matters.
 
-def _get(url, timeout=30):
+def _get(url, timeout=DEFAULT_TIMEOUT, retries=1):
+    """GET some JSON, with one retry.
+
+    A board that times out is reported to the user as a failed source, which
+    reads exactly like "this company is not hiring" -- so it is worth one more
+    attempt before saying it. One retry, not a loop: if a board is down, telling
+    the user quickly is better than hanging on it.
+    """
     req = urllib.request.Request(url, headers={"User-Agent": "recruit-copilot-jobscout/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode())
+    last = None
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode())
+        except Exception as e:                      # noqa: BLE001 - reported, not swallowed
+            last = e
+            if attempt < retries:
+                time.sleep(1.0)
+    raise last
 
 
 def score_job(title, location, search, jd_text=""):
@@ -55,8 +88,8 @@ def _comp_from_text(text):
 
 
 # ---- ATS adapters: normalize to {title, location, url, id, raw_jd_fetch()} ----
-def fetch_greenhouse(token):
-    data = _get(f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs")
+def fetch_greenhouse(token, timeout=DEFAULT_TIMEOUT):
+    data = _get(f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs", timeout)
     out = []
     for j in data.get("jobs", []):
         out.append({"title": j.get("title", ""), "location": (j.get("location") or {}).get("name", ""),
@@ -65,8 +98,8 @@ def fetch_greenhouse(token):
     return out
 
 
-def fetch_ashby(org):
-    data = _get(f"https://api.ashbyhq.com/posting-api/job-board/{org}")
+def fetch_ashby(org, timeout=DEFAULT_TIMEOUT):
+    data = _get(f"https://api.ashbyhq.com/posting-api/job-board/{org}", timeout)
     out = []
     for j in data.get("jobs", []):
         if j.get("isListed") is False:
@@ -94,28 +127,50 @@ def _plain(content: str) -> str:
     return re.sub(r"[ \t]*\n\s*\n\s*", "\n\n", re.sub(r"[ \t]+", " ", text)).strip()
 
 
-def hydrate_jd(job):
+def hydrate_jd(job, timeout=DEFAULT_TIMEOUT):
     """Ensure job['jd_text'] is populated (Ashby already has it; Greenhouse fetch content)."""
     if job.get("jd_text"):
         return job
     if job["ats"] == "greenhouse":
         try:
-            d = _get(f"https://boards-api.greenhouse.io/v1/boards/{job['token']}/jobs/{job['id']}?content=true")
+            d = _get(f"https://boards-api.greenhouse.io/v1/boards/{job['token']}/jobs/{job['id']}?content=true",
+                     timeout)
             job["jd_text"] = _plain(d.get("content", ""))
         except Exception:
             job["jd_text"] = ""
     return job
 
 
-def scout(per_company=5, min_match=None):
-    """Two passes, on purpose.
+def load_bank():
+    """The experience bank the qualification pass reads. Missing is fine and
+    common (the scout runs before intake for plenty of people); qualification
+    stands its bank-driven checks down rather than failing everything."""
+    try:
+        with open(MASTER) as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
-    Titles and locations are free to score, but pay is only in the posting body,
-    which costs a fetch per role. So: score on title first, keep what survives,
-    fetch the body for the top few per company, then re-score those WITH the pay
-    so the comp floor you set actually moves the number instead of being decorative.
+
+def scout(per_company=5, min_match=None, timeout=DEFAULT_TIMEOUT):
+    """Three passes, on purpose.
+
+    Titles and locations are free to score, but the two things that decide whether
+    a role is worth your afternoon -- what it pays and what it requires -- are only
+    in the posting body, which costs a fetch per role. So: score on title first,
+    keep what survives, fetch the body for the leading CANDIDATE_MULTIPLE x N per
+    company, then re-score those with the pay AND run the qualification pass, then
+    re-rank and keep the best N.
+
+    The candidate pool is deliberately wider than the N that get reported. The
+    qualification pass exists to move roles DOWN, so if it only ever saw the top N
+    it would hand back a shorter list rather than a better one -- the role that
+    should have taken the demoted one's place was never looked at.
     """
     search = search_goals.load(STATE)          # raises NoGoals; the caller must stop
+    profile = search.get("profile") or {}
+    bank = load_bank()
 
     companies = DEFAULT_COMPANIES
     if os.path.exists(CFG):
@@ -124,6 +179,7 @@ def scout(per_company=5, min_match=None):
         except Exception:
             pass
     min_match = min_match if min_match is not None else int(search.get("min_match", 55))
+    n_candidates = min(max(per_company * CANDIDATE_MULTIPLE, per_company), CANDIDATE_CAP)
 
     flat, review, sources = [], [], []
     for c in companies:
@@ -142,7 +198,7 @@ def scout(per_company=5, min_match=None):
                             "error": f'unknown ats "{ats}" — use "greenhouse" or "ashby"'})
             continue
         try:
-            jobs = fetch_ashby(token) if ats == "ashby" else fetch_greenhouse(token)
+            jobs = fetch_ashby(token, timeout) if ats == "ashby" else fetch_greenhouse(token, timeout)
         except Exception as e:
             sources.append({"company": name, "ok": False, "error": str(e)})
             continue
@@ -151,49 +207,82 @@ def scout(per_company=5, min_match=None):
             j["match"], j["why"] = score_job(j["title"], j["location"], search)
         jobs.sort(key=lambda x: x["match"], reverse=True)
         kept = [j for j in jobs if j["match"] >= min_match]
-        sources.append({"company": name, "ok": True, "total": len(jobs), "matched": len(kept)})
 
-        top = kept[:per_company]
-        for j in top:
-            hydrate_jd(j)
-            j["comp"] = _comp_from_text(j.get("jd_text", ""))
+        candidates = kept[:n_candidates]
+        for j in candidates:
+            hydrate_jd(j, timeout)
+            jd = j.get("jd_text") or ""
+            j["comp"] = _comp_from_text(jd)
             # second pass: the posting body is here now, so pay can count
-            j["match"], j["why"] = score_job(j["title"], j["location"], search, j.get("jd_text", ""))
-        top.sort(key=lambda x: x["match"], reverse=True)
-        flat.extend(kept)
-        review.append({"name": name, "ats": ats, "token": token,
+            base, why = score_job(j["title"], j["location"], search, jd)
+            # third pass: and so can whether you could get it
+            a = qualification.assess(j["title"], jd, bank, profile)
+            j["match"] = qualification.apply(base, a)
+            j["why"] = why + a.reasons
+            j["fit"] = a.fit
+        candidates.sort(key=lambda x: x["match"], reverse=True)
+        counts = {k: sum(1 for j in candidates if j.get("fit") == k)
+                  for k in (qualification.FIT, qualification.STRETCH, qualification.UNQUALIFIED)}
+        sources.append({"company": name, "ok": True, "total": len(jobs), "matched": len(kept),
+                        "assessed": len(candidates), "fit_counts": counts})
+
+        top = candidates[:per_company]
+        # Every row the Jobs tab shows has been through the qualification pass.
+        # Carrying the un-fetched remainder of `kept` would put un-checked 99s
+        # back at the top of the table, which is the bug this whole pass exists
+        # to fix; `sources[].matched` still reports how many cleared min_match.
+        flat.extend(candidates)
+        review.append({"name": name, "ats": ats, "token": token, "fit_counts": counts,
                        "jobs": [{k: j.get(k) for k in ("title", "location", "url", "id", "ats", "token",
-                                                       "match", "why", "comp", "jd_text")} for j in top]})
+                                                       "match", "why", "comp", "fit", "jd_text")} for j in top]})
 
     flat.sort(key=lambda x: x["match"], reverse=True)
     now = datetime.now(timezone.utc).isoformat()
+    total_matched = sum(s.get("matched", 0) for s in sources if s.get("ok"))
     json.dump({"generated": now, "search": search,
-               "sources": sources, "total_matched": len(flat), "shown": min(60, len(flat)),
+               "sources": sources, "total_matched": total_matched, "assessed": len(flat),
+               "shown": min(60, len(flat)),
                "jobs": [dict({k: j.get(k) for k in ("company", "title", "location",
-                                                     "match", "why", "comp", "url")},
+                                                     "match", "why", "comp", "fit", "url")},
                              # the posting body, for the roles deep enough to have been
                              # hydrated, so /recruit:tailor has something to tailor TO
                              # instead of asking the user to paste it back in
                              jd_text=(j.get("jd_text") or "")[:12000] or None)
                         for j in flat[:60]],
-               "note": f"{len(flat)} roles matched across {len([s for s in sources if s.get('ok')])} boards (Greenhouse + Ashby, ToS-clean), scored against your goals."},
+               "note": (f"{total_matched} roles matched across "
+                        f"{len([s for s in sources if s.get('ok')])} boards (Greenhouse + Ashby, "
+                        f"ToS-clean); the leading {len(flat)} were read in full and checked against "
+                        f"your experience bank"
+                        + ("" if bank else " (no experience bank yet, so only the level checks ran)")
+                        + ".")},
               open(JOBS_OUT, "w"), indent=2, default=str)
-    return {"sources": sources, "review": review, "flat": len(flat)}
+    return {"sources": sources, "review": review, "flat": len(flat), "matched": total_matched}
+
+
+def _fit_summary(counts):
+    c = counts or {}
+    return (f"fit {c.get(qualification.FIT, 0)} / stretch {c.get(qualification.STRETCH, 0)} "
+            f"/ unqualified {c.get(qualification.UNQUALIFIED, 0)}")
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--per-company", type=int, default=5)
-    ap.add_argument("--min", type=int, default=None)
+    ap = argparse.ArgumentParser(description="Scout open roles and score them against your goals "
+                                             "AND your experience bank.")
+    ap.add_argument("--per-company", type=int, default=5,
+                    help="how many roles to report per board (default 5)")
+    ap.add_argument("--min", type=int, default=None,
+                    help="minimum title score to consider (default: min_match from goals.json)")
+    ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
+                    help=f"seconds to wait on each board request, retried once (default {DEFAULT_TIMEOUT})")
     a = ap.parse_args()
     try:
-        r = scout(a.per_company, a.min)
+        r = scout(a.per_company, a.min, a.timeout)
     except search_goals.NoGoals as e:
         print(f"\n{e}\n", file=sys.stderr)
         sys.exit(2)
     for co in r["review"]:
-        print(f"{co['name']:<12} {len(co['jobs'])} selected: " +
-              ", ".join(f"{j['title'][:28]}({j['match']})" for j in co["jobs"][:3]) + " ...")
+        print(f"{co['name']:<12} {len(co['jobs'])} selected [{_fit_summary(co.get('fit_counts'))}]: " +
+              ", ".join(f"{j['title'][:28]}({j['match']}/{j.get('fit', '?')})" for j in co["jobs"][:3]) + " ...")
 
     # A board that failed is not a board with no matches. Say so, loudly, or a typo'd
     # token looks exactly like "this company is not hiring".

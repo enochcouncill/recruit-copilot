@@ -52,6 +52,7 @@ def main() -> int:
             "skills/resume-intake/scripts/extract_text.py",
             "dashboard/job_scout.py",
             "dashboard/search_goals.py",
+            "dashboard/qualification.py",
         ]
         for s in scripts:
             p = run([os.path.join(ROOT, s), "--help"])
@@ -211,6 +212,133 @@ def main() -> int:
               f"shown={band[2] if band else None!r} why={pay_why!r}")
         check("a signing bonus does not become the bottom of the band",
               search_goals.pay_band("Pay: $180,000 to $260,000, plus a $25,000 signing bonus.")[0] == 180000, "")
+
+        # 3e. The qualification pass: could this person actually GET the role?
+        # Scoring title/level/location/pay alone put a Corporate Development LEAD
+        # at $425-600k and a PRINCIPAL Product Manager at the top of a second-year
+        # MBA's list. Both were the right shape and neither was reachable.
+        print("\n3e. qualification pass (can you actually get it?)")
+        import qualification  # noqa: E402
+
+        years_cases = [
+            ("5+ years of experience in product management", 5),
+            ("7-10 years of relevant experience", 7),
+            ("3–5 years of experience", 3),
+            ("minimum of 8 years of experience", 8),
+            ("at least 6 yrs of experience", 6),
+            ("8+ yrs. of experience leading teams", 8),
+            ("A minimum of five years of experience", 5),
+            ("10 years' experience in a similar role", 10),
+            ("Experience: 12+ years", 12),
+            ("Bachelor's degree and 5 years of related experience", 5),
+            # a preferred ceiling must never outrank the stated floor
+            ("Preferred: 10+ years of experience. Required: 5+ years of experience.", 5),
+            ("0-2 years of experience", 0),
+            # and the three that must NOT be read as a requirement
+            ("A 4-year degree is required, plus strong communication skills", None),
+            ("We have served customers for 25 years", None),
+            ("Compensation is $120,000 - $180,000 per year", None),
+        ]
+        wrong = [(t, qualification.years_required(t), want)
+                 for t, want in years_cases if qualification.years_required(t) != want]
+        check("years parser reads a dozen real phrasings, and refuses three lookalikes",
+              not wrong, f"{len(years_cases) - len(wrong)}/{len(years_cases)}; wrong={wrong[:3]}")
+
+        ceil = qualification.DEFAULT_LEVEL_CEILING
+        lvl_cases = [("Principal Publishing Product Manager", True), ("Director of Product", True),
+                     ("VP of Strategy", True), ("Head of Corporate Development", True),
+                     ("Staff Software Engineer", True), ("General Partner", True),
+                     ("GM, Payments", True), ("Distinguished Engineer", True),
+                     ("Chief Financial Officer", True),
+                     # the exceptions: a target title, a junior title, and a
+                     # partner-facing title that is not a partnership
+                     ("Chief of Staff", False), ("Chief of Staff, Product", False),
+                     ("Staff Accountant", False), ("Partner Marketing Manager", False),
+                     ("Senior Product Manager", False), ("Team Lead", False)]
+        bad_lvl = [t for t, want in lvl_cases if bool(qualification.level_ceiling_hits(t, ceil)) != want]
+        check("level ceiling fires on nine senior titles and spares Chief of Staff",
+              not bad_lvl, f"misjudged={bad_lvl}")
+        check("'Lead <role>' is a modifier, 'Team Lead' is not",
+              qualification.lead_is_seniority_modifier("Lead Product Manager")
+              and not qualification.lead_is_seniority_modifier("Technical Lead"), "")
+
+        ex_bank = json.load(open(bank_src))          # the shipped backend-engineer bank
+        prof5 = {"years_experience": 5}
+        jd_reach = ("About the role\n\nQualifications\n\n- 12+ years of experience building "
+                    "distributed systems\n- Deep Kubernetes and Kafka expertise\n"
+                    "- Postgres, Redis and streaming pipelines at scale\n")
+        a = qualification.assess("Director of Platform Engineering", jd_reach, ex_bank, prof5)
+        check("12 years asked of a 5-year bank is unqualified, and says both numbers",
+              a.fit == "unqualified" and a.delta <= -35
+              and any("12" in r and "5" in r for r in a.reasons), f"{a.fit} {a.delta} {a.reasons}")
+
+        jd_stretch = jd_reach.replace("12+ years", "8+ years")
+        a = qualification.assess("Senior Software Engineer", jd_stretch, ex_bank, prof5)
+        check("8 years asked of a 5-year bank is a stretch, not a knockout",
+              a.fit == "stretch" and a.delta == qualification.YEARS_STRETCH_PENALTY,
+              f"{a.fit} {a.delta}")
+
+        jd_fit = jd_reach.replace("12+ years", "5+ years")
+        a = qualification.assess("Senior Software Engineer", jd_fit, ex_bank, prof5)
+        check("a role at your own level with your own stack is a clean fit",
+              a.fit == "fit" and a.delta == 0 and a.cap is None, f"{a.fit} {a.delta} cap={a.cap}")
+
+        # Overlap: same seniority, a field this bank has nothing to say about.
+        jd_far = ("Requirements\n\n- Licensed clinical experience in inpatient oncology nursing\n"
+                  "- Familiarity with Epic charting, HIPAA documentation and infusion protocols\n"
+                  "- Phlebotomy certification and bedside patient triage\n"
+                  "- Comfortable coordinating discharge planning with attending physicians\n")
+        a = qualification.assess("Clinical Program Manager", jd_far, ex_bank, prof5)
+        check("a posting whose requirements the bank cannot answer is capped at 60",
+              a.cap == qualification.OVERLAP_CAP and any("matched" in r for r in a.reasons),
+              f"cap={a.cap} {a.reasons}")
+        check("the cap is a ceiling, not a subtraction",
+              qualification.apply(99, a) == 60 and qualification.apply(42, a) == 42,
+              f"99->{qualification.apply(99, a)} 42->{qualification.apply(42, a)}")
+
+        a = qualification.assess("Senior Software Engineer",
+                                 "Requirements\n\n- A PhD in computer science is required\n"
+                                 "- 5+ years of experience with Kubernetes and Kafka\n",
+                                 ex_bank, prof5)
+        check("a stated credential the bank does not hold is a knockout",
+              a.fit == "unqualified" and a.delta <= -40 and any("doctorate" in r for r in a.reasons),
+              f"{a.fit} {a.delta} {a.reasons}")
+        clearance = ("Requirements\n\n- Ability to obtain a security clearance\n"
+                     "- 5+ years of experience with distributed systems, Kafka and Postgres\n")
+        a = qualification.assess("Senior Software Engineer", clearance, ex_bank, prof5)
+        check("'ability to obtain a clearance' is a hiring promise, not a knockout",
+              a.fit == "fit", f"{a.fit} {a.reasons}")
+
+        # No profile means the tool does not know who you are, and guessing is the
+        # one thing goals.json exists to prevent. The bank-driven checks still run.
+        a = qualification.assess("Director of Platform Engineering", jd_reach, ex_bank, None)
+        check("with no profile the years and level checks stand down",
+              a.fit == "fit" and a.delta == 0, f"{a.fit} {a.delta} {a.reasons}")
+        a = qualification.assess("Senior Software Engineer", jd_far, {}, prof5)
+        check("with no experience bank the overlap check stands down (no bank is not no skills)",
+              a.cap is None, f"cap={a.cap} {a.reasons}")
+        # Every other key in the search block falls back to the example. `profile`
+        # must not: it is a claim about who the user IS, and inheriting the
+        # example's "8 years" would tell a career changer they are qualified for
+        # roles they are not, in the tool's own confident voice.
+        gdir = os.path.join(ws, "goals-no-profile")
+        os.makedirs(gdir, exist_ok=True)
+        json.dump({"search": {"titles": {"strong": ["site reliability engineer"]}}},
+                  open(os.path.join(gdir, "goals.json"), "w"))
+        loaded = search_goals.load(gdir)
+        check("a search block with no profile does not inherit the example's",
+              loaded.get("profile") == {}
+              and search_goals.EXAMPLE_SEARCH["profile"].get("years_experience"),
+              f"profile={loaded.get('profile')!r}")
+        json.dump({"search": {"titles": {"strong": ["site reliability engineer"]},
+                              "profile": {"years_experience": 3}}},
+                  open(os.path.join(gdir, "goals.json"), "w"))
+        check("a profile the user did write survives the merge intact",
+              search_goals.load(gdir).get("profile") == {"years_experience": 3}, "")
+
+        check("the requirements section is found, not the whole posting",
+              "Kubernetes" in qualification.requirements_section(jd_reach)
+              and "About the role" not in qualification.requirements_section(jd_reach), "")
 
         # 4. Grading math: a known panel must produce the documented numbers.
         print("\n4. panel aggregation math")
