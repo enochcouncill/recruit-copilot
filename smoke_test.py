@@ -315,8 +315,8 @@ def main() -> int:
         check("with no profile the years and level checks stand down",
               a.fit == "fit" and a.delta == 0, f"{a.fit} {a.delta} {a.reasons}")
         a = qualification.assess("Senior Software Engineer", jd_far, {}, prof5)
-        check("with no experience bank the overlap check stands down (no bank is not no skills)",
-              a.cap is None, f"cap={a.cap} {a.reasons}")
+        check("with no experience bank the overlap check stands down, and says so",
+              a.cap is None and a.fit == "unverified", f"cap={a.cap} fit={a.fit} {a.reasons}")
         # Every other key in the search block falls back to the example. `profile`
         # must not: it is a claim about who the user IS, and inheriting the
         # example's "8 years" would tell a career changer they are qualified for
@@ -339,6 +339,71 @@ def main() -> int:
         check("the requirements section is found, not the whole posting",
               "Kubernetes" in qualification.requirements_section(jd_reach)
               and "About the role" not in qualification.requirements_section(jd_reach), "")
+
+        # 3f. Four adversarial cases, one per bug found in review. Each of these
+        # produced a confident, wrong answer before the fix, which is the only
+        # kind of wrong answer that matters in a tool people act on.
+        print("\n3f. adversarial: the four ways this pass lied")
+
+        # (1) A company bragging about its own tenure is not a requirement. This
+        # read as "12 years required" and sank the role by 35 points.
+        brag = ("About us\n\nOur team has 12 years of experience serving customers, and we have "
+                "been trusted for over 20 years of experience in the field.\n")
+        check("a company's own tenure is not a years requirement",
+              qualification.required_years(brag) is None
+              and qualification.years_required(brag) == 12,   # the raw parser still sees it
+              f"required={qualification.required_years(brag)} raw={qualification.years_required(brag)}")
+        a = qualification.assess("Senior Software Engineer", brag, ex_bank, prof5)
+        check("  ...so the About-us paragraph costs the role nothing",
+              a.delta == 0 and a.fit == "unverified", f"{a.fit} {a.delta}")
+        check("  ...but a requirement outside any section still counts, when anchored",
+              qualification.required_years(
+                  "We are looking for someone with at least 9 years of experience.") == 9, "")
+
+        # (2) The posting's own concession that a doctorate is OPTIONAL became the
+        # reason it was treated as mandatory, because the match crossed a `;`.
+        # Both spellings matter: the long one is caught by the character budget
+        # alone, the SHORT one is caught only by the clause split -- so without
+        # the short case this test would pass against the unfixed code.
+        preferred = ["A PhD is preferred; a master's degree in a related field is required.",
+                     "PhD preferred; a BS is required.",
+                     "PhD or equivalent, degree required.",
+                     "CPA preferred; a bachelor degree is required."]
+        still_knocked = [p for p in preferred if qualification.knockouts(p, set())]
+        check("a credential the posting calls OPTIONAL never becomes a knockout",
+              not still_knocked, f"leaked={still_knocked}")
+        check("  ...while the same sentence without the concession still knocks out",
+              qualification.knockouts("A PhD in statistics is required.", set()) == ["a doctorate"], "")
+        check("  ...and a bank that holds the credential is never knocked out by it",
+              qualification.knockouts("A PhD in statistics is required.", {"phd"}) == [], "")
+
+        # (3) A Greenhouse detail fetch that fails sets jd_text="" -- and an empty
+        # posting used to come back tagged 'fit', which is the tool at its most
+        # confident exactly where it knows least.
+        a = qualification.assess("Senior Software Engineer", "", ex_bank, prof5)
+        check("an unreadable posting is 'unverified', never 'fit'",
+              a.fit == "unverified" and a.delta == 0 and a.cap is None, f"{a.fit} {a.delta}")
+        # "we could not read it" and "we read it and it said nothing" both end at
+        # unverified, but they are different problems and the row has to say which.
+        check("  ...and says the body could not be read, not that it said nothing",
+              any("could not be read" in r for r in a.reasons), f"{a.reasons}")
+        # ...and a posting that is all marketing gets no cap, because the
+        # denominator would be company prose no resume would ever match.
+        prose = ("About us\n\nWe are a mission-driven company reimagining the future of "
+                 "hospitality through delightful guest journeys, artisanal sourcing and "
+                 "regenerative agriculture across our boutique properties.\n")
+        a = qualification.assess("Senior Software Engineer", prose, ex_bank, prof5)
+        check("a posting with no requirements section is never capped on its marketing copy",
+              a.cap is None and a.fit == "unverified", f"cap={a.cap} fit={a.fit} {a.reasons}")
+        check("'unverified' is a real state the dashboard knows how to draw",
+              "unverified" in qualification.FITS
+              and "unverified:" in open(os.path.join(ROOT, "dashboard/index.html")).read(), "")
+
+        # (4) --per-company is a promise about the table, not just the console.
+        # jobs.json was being written from the whole 2xN candidate pool.
+        src = open(os.path.join(ROOT, "dashboard/job_scout.py")).read()
+        check("jobs.json is written from the reported top N, not the candidate pool",
+              "flat.extend(top)" in src and "flat.extend(candidates)" not in src, "")
 
         # 4. Grading math: a known panel must produce the documented numbers.
         print("\n4. panel aggregation math")

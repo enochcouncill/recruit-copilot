@@ -29,6 +29,10 @@ Deliberately NOT here: anything that guesses. If the posting does not state a
 years requirement, no years penalty is applied. If it has no parseable
 requirements, no overlap penalty is applied. An unstated requirement is not a
 failed one -- the same rule the pay scorer already follows.
+
+And when a posting cannot be read at all, or reads as nothing checkable, the
+answer is `unverified` rather than `fit`. "I found no problem" and "I could not
+look" are different sentences, and only one of them should be reassuring.
 """
 
 from __future__ import annotations
@@ -36,8 +40,14 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
-FIT, STRETCH, UNQUALIFIED = "fit", "stretch", "unqualified"
-_RANK = {FIT: 0, STRETCH: 1, UNQUALIFIED: 2}
+# UNVERIFIED is not a fourth severity, it is the absence of one: the posting body
+# could not be read, or could be read and said nothing checkable. It exists
+# because the alternative is worse -- a failed Greenhouse fetch used to come back
+# tagged "fit", so the label the user trusts most was strongest exactly where the
+# tool knew least. Silence has to look like silence.
+FIT, STRETCH, UNQUALIFIED, UNVERIFIED = "fit", "stretch", "unqualified", "unverified"
+FITS = (FIT, STRETCH, UNQUALIFIED, UNVERIFIED)
+_RANK = {UNVERIFIED: -1, FIT: 0, STRETCH: 1, UNQUALIFIED: 2}
 
 
 class Assessment(NamedTuple):
@@ -111,22 +121,60 @@ def _is_about_experience(text: str, start: int, end: int) -> bool:
     return bool(_EXPERIENCE_NEAR.search(text[max(0, start - _BEFORE):end + _AFTER]))
 
 
+def _year_matches(text: str) -> List[Tuple[int, int, int]]:
+    """Every (years, start, end) the text states about experience."""
+    out: List[Tuple[int, int, int]] = []
+    for rx in (_RE_RANGE, _RE_FLOOR, _RE_SINGULAR, _RE_PLAIN):
+        for m in rx.finditer(text or ""):
+            v = _num(m.group(1))
+            if v is None or not (0 <= v <= 40):
+                continue
+            if _is_about_experience(text, m.start(), m.end()):
+                out.append((v, m.start(), m.end()))
+    return out
+
+
 def years_required(jd_text: str) -> Optional[int]:
-    """The smallest minimum number of years the posting states, or None.
+    """The smallest number of years of experience the TEXT GIVEN states, or None.
 
     Smallest, not largest, on purpose: postings routinely carry both a required
     floor and a higher "preferred" one, and the user is entitled to be judged
     against the floor.
+
+    This is the parser, not the decision. It reads any experience-years phrase in
+    whatever you hand it, so handing it a whole posting will read the company's
+    own tenure ("our team has 12 years of experience serving customers") as a
+    requirement. `required_years` is the function that decides; call that.
     """
+    found = [v for v, _s, _e in _year_matches(jd_text or "")]
+    return min(found) if found else None
+
+
+# Requirement language. A years phrase outside the requirements section only
+# counts when one of these sits beside it -- otherwise the About-us paragraph
+# bragging about a decade in business becomes a ten-year requirement, and the
+# tool tells the user they are unqualified on the strength of a marketing line.
+_REQ_ANCHOR = re.compile(
+    r"require|must\s+have|must\s+possess|minimum|min\.|at\s+least|qualificat"
+    r"|you\s+(?:have|bring|are)|you(?:'|’)?(?:ll|\s+will)\s+(?:have|bring|need)"
+    r"|looking\s+for|preferred|proven\s+track", re.I)
+_ANCHOR_WINDOW = 120
+
+
+def required_years(jd_text: str, requirements_text: Optional[str] = None) -> Optional[int]:
+    """The years the posting REQUIRES, as opposed to any years it mentions.
+
+    Inside an extracted requirements section, every stated number is a
+    requirement by construction, so the parser runs unguarded. With no section to
+    read, each candidate has to be anchored by requirement language nearby or it
+    does not count -- a posting that only talks about itself must produce no
+    requirement at all, not a made-up one.
+    """
+    if requirements_text and requirements_text.strip():
+        return years_required(requirements_text)
     text = jd_text or ""
-    found: List[int] = []
-    for rx, group in ((_RE_RANGE, 1), (_RE_FLOOR, 1), (_RE_SINGULAR, 1), (_RE_PLAIN, 1)):
-        for m in rx.finditer(text):
-            v = _num(m.group(group))
-            if v is None or not (0 <= v <= 40):
-                continue
-            if _is_about_experience(text, m.start(), m.end()):
-                found.append(v)
+    found = [v for v, s, e in _year_matches(text)
+             if _REQ_ANCHOR.search(text[max(0, s - _ANCHOR_WINDOW):e + _ANCHOR_WINDOW])]
     return min(found) if found else None
 
 
@@ -188,32 +236,44 @@ def lead_is_seniority_modifier(title: str) -> bool:
 # --------------------------------------------------------------------------
 # 3. Hard knockouts
 # --------------------------------------------------------------------------
-# (label, requirement pattern, tokens that would prove the bank has it)
+# (label, requirement pattern, proofs the bank holds the credential)
 # Small and explicit on purpose. Every entry here can end a job's chances, so
 # each one has to be a phrase a posting only writes when it means it.
-_KNOCKOUTS: Tuple[Tuple[str, "re.Pattern[str]", Tuple[str, ...]], ...] = (
+#
+# Each pattern is matched against ONE CLAUSE at a time, never across a sentence.
+# The gap-tolerant version ("PhD" ... within 40 characters ... "required") read
+# "PhD preferred; a master's degree is required" as a doctorate requirement --
+# the posting's own concession that a doctorate is optional became the reason it
+# was treated as mandatory.
+#
+# A proof is an ALL-OF group of bank terms: ("juris", "doctor") matches a bank
+# containing both tokens. Set membership, not substring search on a joined blob,
+# because "cpa" is a substring of a dozen innocent words.
+_KNOCKOUTS: Tuple[Tuple[str, "re.Pattern[str]", Tuple[Tuple[str, ...], ...]], ...] = (
     ("a doctorate",
-     re.compile(r"(?:ph\.?\s?d\.?|doctoral degree|doctorate)[^.\n]{0,40}\b(?:is\s+)?(?:required|mandatory)\b"
-                r"|(?:must have|requires?|require)\s+(?:an?\s+)?(?:ph\.?\s?d\.?|doctorate)", re.I),
-     ("phd", "ph.d", "doctorate", "doctoral")),
+     re.compile(r"(?:phd|doctoral degree|doctorate).{0,40}\b(?:is\s+)?(?:required|mandatory)\b"
+                r"|(?:must have|requires?|require)\s+(?:an?\s+)?(?:phd|doctorate)", re.I),
+     (("phd",), ("doctorate",), ("doctoral",))),
     ("a professional license",
      re.compile(r"must be (?:a\s+)?(?:currently\s+)?licensed|licensure is required|"
                 r"(?:current|active|valid)\s+(?:state\s+)?licens(?:e|ure)\s+(?:is\s+)?required", re.I),
-     ("licensed", "licensure", "license #")),
+     (("licensed",), ("licensure",), ("license",))),
     ("an active security clearance",
-     re.compile(r"active\s+(?:ts\s*/\s*sci|top\s+secret|secret|dod|security)\s*(?:clearance)?"
-                r"|security clearance\s+(?:is\s+)?required"
-                r"|must (?:have|possess|hold)\s+(?:an?\s+)?(?:active\s+)?(?:ts\s*/\s*sci|security clearance)", re.I),
-     ("clearance", "ts/sci", "top secret")),
+     re.compile(r"(?:active|current)\s+(?:ts\s*/\s*sci|top\s+secret|secret|dod|security)\s*"
+                r"clearance\b.{0,40}\b(?:required|mandatory)\b"
+                r"|(?:security|ts\s*/\s*sci)\s*clearance\s+(?:is\s+)?(?:required|mandatory)"
+                r"|must (?:have|possess|hold)\s+(?:an?\s+)?(?:active|current)?\s*"
+                r"(?:ts\s*/\s*sci|security\s+clearance|clearance)", re.I),
+     (("clearance",), ("sci",), ("secret",))),
     ("a CPA",
-     re.compile(r"\bcpa\b[^.\n]{0,30}\b(?:required|mandatory)\b|must be a (?:licensed )?cpa"
+     re.compile(r"\bcpa\b.{0,30}\b(?:required|mandatory)\b|must be a (?:licensed )?cpa"
                 r"|(?:active|current)\s+cpa\b", re.I),
-     ("cpa",)),
+     (("cpa",),)),
     ("a law degree",
-     re.compile(r"\b(?:j\.?d\.?|juris doctor|law degree)\b[^.\n]{0,30}\b(?:required|mandatory)\b"
+     re.compile(r"\b(?:jd|juris doctor|law degree)\b.{0,30}\b(?:required|mandatory)\b"
                 r"|(?:member(?:ship)? (?:in good standing )?of|admitted to) the\s+\w*\s*bar\b"
                 r"|active bar (?:membership|admission)", re.I),
-     ("juris doctor", "law degree", "bar admission", "attorney")),
+     (("juris", "doctor"), ("law", "degree"), ("bar", "admission"), ("attorney",))),
 )
 
 # "Ability to obtain a security clearance" is a hiring promise, not a knockout;
@@ -221,23 +281,35 @@ _KNOCKOUTS: Tuple[Tuple[str, "re.Pattern[str]", Tuple[str, ...]], ...] = (
 # posting, and reading it as a hard requirement would delete an entire board.
 _OBTAINABLE = re.compile(r"(?:able|ability|eligib\w*|willing\w*)\s+to\s+(?:obtain|acquire|receive)", re.I)
 
+# The credentials whose own names contain the character we split clauses on.
+# Normalising them first is what lets the splitter be as blunt as it should be.
+_ABBREV = ((re.compile(r"\bph\.?\s*d\.?", re.I), "phd"),
+           (re.compile(r"\bj\.\s*d\.", re.I), "jd"),
+           (re.compile(r"\bu\.\s*s\.", re.I), "us"))
+_CLAUSE_SPLIT = re.compile(r"[.;,\n]")
+
+
+def _clauses(text: str) -> List[str]:
+    """The posting, one clause at a time. A requirement and its credential have to
+    live in the same breath to mean each other."""
+    t = text or ""
+    for rx, repl in _ABBREV:
+        t = rx.sub(repl, t)
+    return [c for c in (part.strip() for part in _CLAUSE_SPLIT.split(t)) if c]
+
 
 def knockouts(jd_text: str, bank_terms: Iterable[str]) -> List[str]:
     """Credentials the posting says it requires that the bank does not show."""
-    text = jd_text or ""
     have = set(bank_terms)
-    blob = " ".join(have)
+    clauses = _clauses(jd_text)
     out = []
     for label, rx, proofs in _KNOCKOUTS:
-        m = rx.search(text)
-        if not m:
-            continue
-        window = text[max(0, m.start() - 80):m.start() + 40]
-        if _OBTAINABLE.search(window):
-            continue
-        if any(p in have or p in blob for p in proofs):
-            continue
-        out.append(label)
+        if any(all(tok in have for tok in group) for group in proofs):
+            continue                                  # the bank holds it
+        for clause in clauses:
+            if rx.search(clause) and not _OBTAINABLE.search(clause):
+                out.append(label)
+                break
     return out
 
 
@@ -489,6 +561,9 @@ def assess(title: str, jd_text: str, bank: Optional[dict],
     stranger's search against somebody else's seniority is the exact failure the
     goals file exists to prevent. The bank-driven checks still run, because those
     read only from files the user confirmed themselves.
+
+    Returns fit=`unverified` when the posting body is empty (a failed fetch) or
+    no check could reach any evidence in it.
     """
     profile = profile or {}
     reasons: List[str] = []
@@ -496,6 +571,14 @@ def assess(title: str, jd_text: str, bank: Optional[dict],
     fit = FIT
     cap: Optional[int] = None
     jd_text = jd_text or ""
+    # Did any check actually get to look at evidence? A clean "fit" has to mean
+    # "I read the requirements and you meet them", never "I had nothing to read".
+    checked = False
+
+    section = requirements_section(jd_text)
+    if not jd_text.strip():
+        return Assessment(0, ["the posting body could not be read, so nothing was checked"],
+                          UNVERIFIED, None)
 
     # -- 1. years ----------------------------------------------------------
     mine = profile.get("years_experience")
@@ -505,8 +588,9 @@ def assess(title: str, jd_text: str, bank: Optional[dict],
     except (TypeError, ValueError):
         mine = None
     if mine is not None:
-        asked = years_required(jd_text)
+        asked = required_years(jd_text, section)
         if asked is not None:
+            checked = True
             years_gap = asked - mine
             if years_gap >= 4:
                 delta += YEARS_UNQUALIFIED_PENALTY
@@ -541,26 +625,39 @@ def assess(title: str, jd_text: str, bank: Optional[dict],
     # skills" for every posting on earth -- so the bank-driven checks stand down
     # rather than firing on an absence of evidence.
     terms = bank_terms(bank)
-    if not terms:
-        return Assessment(delta, reasons, fit, cap)
 
     # -- 3. hard knockouts -------------------------------------------------
-    missing = knockouts(jd_text, terms)
-    if missing:
-        delta += KNOCKOUT_PENALTY
-        fit = UNQUALIFIED
-        reasons.append("requires " + " and ".join(missing) + ", which your bank does not show")
+    if terms:
+        missing = knockouts(jd_text, terms)
+        if missing:
+            checked = True
+            delta += KNOCKOUT_PENALTY
+            fit = UNQUALIFIED
+            reasons.append("requires " + " and ".join(missing) + ", which your bank does not show")
 
     # -- 4. must-have overlap ----------------------------------------------
-    section = requirements_section(jd_text)
-    had_section = bool(section)
-    ov = overlap(section or jd_text, terms)
-    if ov.ratio is not None and ov.ratio < OVERLAP_MIN_RATIO and ov.considered >= OVERLAP_MIN_TERMS:
-        cap = OVERLAP_CAP
-        fit = _raise_fit(fit, STRETCH)
-        shown = ", ".join(ov.matched[:6]) if ov.matched else "none"
-        where = "required skills" if had_section else "skills in the posting"
-        reasons.append(f"few {where} appear in your bank (matched: {shown})")
+    # Only ever against a REAL requirements section. Run against a whole posting
+    # the denominator is company prose -- an About-us paragraph, a benefits list,
+    # a scam warning -- none of which a resume would ever match, so a fit gets
+    # capped for failing to resemble marketing copy. Ratios from the two sources
+    # are not even on the same scale (0.12-0.22 whole-posting against 0.21-0.59
+    # section-only across 54 real postings), so one threshold cannot serve both.
+    if terms and section:
+        ov = overlap(section, terms)
+        if ov.ratio is not None:
+            checked = True
+            if ov.ratio < OVERLAP_MIN_RATIO and ov.considered >= OVERLAP_MIN_TERMS:
+                cap = OVERLAP_CAP
+                fit = _raise_fit(fit, STRETCH)
+                shown = ", ".join(ov.matched[:6]) if ov.matched else "none"
+                reasons.append(f"few required skills appear in your bank (matched: {shown})")
+
+    if not checked and fit == FIT:
+        # We read the posting and it told us nothing we could test against. That
+        # is not the same as passing, and must not be dressed up as one.
+        return Assessment(delta, reasons + [
+            "no stated requirements could be read from this posting, so nothing was verified"],
+            UNVERIFIED, cap)
 
     return Assessment(delta, reasons, fit, cap)
 
@@ -580,7 +677,10 @@ if __name__ == "__main__":  # pragma: no cover - a hand probe, not a test suite
     bank = json.load(open(a.bank)) if a.bank else {}
     prof = {"years_experience": a.years} if a.years is not None else {}
     res = assess(a.title, jd, bank, prof)
+    section = requirements_section(jd)
     json.dump({"delta": res.delta, "fit": res.fit, "cap": res.cap,
-               "reasons": res.reasons, "years_required": years_required(jd)},
+               "reasons": res.reasons,
+               "years_required": required_years(jd, section),
+               "requirements_section_found": bool(section)},
               sys.stdout, indent=2)
     print()

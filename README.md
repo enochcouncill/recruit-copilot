@@ -42,6 +42,9 @@ you have, a title a level or two above you, a credential you do not hold, and ho
 much of what it asks for appears anywhere in your bank. Each role comes back tagged
 **fit**, **stretch** or **unqualified**, with the sentence that earned the tag, so a
 Director role that wants twelve years stops outranking the job you can get on Monday.
+A posting it could not read, or that states nothing checkable, comes back
+**unverified** rather than fit — "I found no problem" and "I could not look" are
+different sentences, and only one of them should be reassuring.
 
 **4. Tailor.** For one posting it selects only the bullets that job asks for, picks
 the closest summary, and renders a single-column PDF. Then two gates run:

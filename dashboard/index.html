@@ -51,6 +51,7 @@
   .pill.fit{background:rgba(74,222,128,.15);color:var(--good)}
   .pill.stretch{background:rgba(251,191,36,.15);color:var(--warn)}
   .pill.unqual{background:rgba(248,113,113,.15);color:var(--bad)}
+  .pill.unver{background:var(--chip);color:var(--muted);border:1px dashed var(--line)}
   .why{color:var(--muted);font-size:11.5px;line-height:1.4;margin-top:3px}
   .wrap{overflow-x:auto}
   .empty{color:var(--muted);padding:14px 0}
@@ -131,15 +132,20 @@ function renderGoals(d){const c=$("#t-goals");c.innerHTML="";
 
 // fit / stretch / unqualified: whether you could actually GET the role, from
 // dashboard/qualification.py. A high match on a job that is four years out of
-// reach is the failure this label exists to make visible.
-const FITCLASS={fit:"fit",stretch:"stretch",unqualified:"unqual"};
+// reach is the failure this label exists to make visible. `unverified` is the
+// fourth answer and deliberately looks unlike the other three -- the posting
+// could not be read, or stated nothing checkable, and a dashed grey outline is
+// the honest rendering of "no opinion".
+const FITCLASS={fit:"fit",stretch:"stretch",unqualified:"unqual",unverified:"unver"};
 function fitPill(f){return FITCLASS[f]?`<span class='pill ${FITCLASS[f]}'>${esc(f)}</span>`:"";}
 function renderJobs(d){const c=$("#t-jobs");c.innerHTML="";
   const j=d.jobs||[];
   const boards=(d.sources||[]).filter(s=>s.ok).length;
   const withComp=j.filter(x=>x.comp).length;
-  const nFit=j.filter(x=>x.fit==="fit").length, nStretch=j.filter(x=>x.fit==="stretch").length;
-  c.appendChild(kpis([[d.total_matched??j.length,"matched roles"],[boards,"boards scouted"],[(((d.search||{}).comp_min)?"$"+((d.search.comp_min)/1000)+"k+":"any"),"comp floor"],[withComp+"/"+j.length,"comp listed"],[nFit+" · "+nStretch,"fit · stretch"]]));
+  const n=f=>j.filter(x=>x.fit===f).length;
+  const kFit=[[n("fit")+" · "+n("stretch"),"fit · stretch"]];
+  if(n("unverified"))kFit.push([n("unverified"),"unverified",'m']);
+  c.appendChild(kpis([[d.total_matched??j.length,"matched roles"],[boards,"boards scouted"],[(((d.search||{}).comp_min)?"$"+((d.search.comp_min)/1000)+"k+":"any"),"comp floor"],[withComp+"/"+j.length,"comp listed"],...kFit]));
   if(d.generated)c.appendChild(el("div","mut","last scouted "+esc(d.generated.slice(0,16).replace("T"," "))+" · "+esc(d.note||"")));
   if(!j.length){c.appendChild(note(d.note||"No jobs yet. Run job_scout.py."));return;}
   const wrap=el("div","wrap card");let h="<table><tr><th>Match</th><th>Fit</th><th>Company</th><th>Role</th><th>Location</th><th>Comp</th></tr>";

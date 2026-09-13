@@ -136,21 +136,39 @@ def hydrate_jd(job, timeout=DEFAULT_TIMEOUT):
             d = _get(f"https://boards-api.greenhouse.io/v1/boards/{job['token']}/jobs/{job['id']}?content=true",
                      timeout)
             job["jd_text"] = _plain(d.get("content", ""))
-        except Exception:
+        except Exception as e:                      # noqa: BLE001 - recorded, not swallowed
+            # An empty body used to be indistinguishable from a posting that says
+            # nothing, and both came out of the qualification pass tagged "fit".
+            # Keep the reason, so the row can be honest about why it was not read.
             job["jd_text"] = ""
+            job["jd_error"] = str(e)
     return job
 
 
 def load_bank():
     """The experience bank the qualification pass reads. Missing is fine and
     common (the scout runs before intake for plenty of people); qualification
-    stands its bank-driven checks down rather than failing everything."""
+    stands its bank-driven checks down rather than failing everything.
+
+    A CORRUPT bank is not fine, and must not look like a missing one -- silently
+    scoring every role as if the user had no experience is the failure that would
+    take longest to notice."""
+    if not os.path.exists(MASTER):
+        return {}
     try:
         with open(MASTER) as fh:
             data = json.load(fh)
-        return data if isinstance(data, dict) else {}
-    except Exception:
+    except Exception as e:                          # noqa: BLE001 - reported below
+        print(f"WARNING: {MASTER} could not be read ({e}).\n"
+              f"         The qualification pass will run without an experience bank, so the "
+              f"skills and credential checks are OFF. Fix the file or re-run /recruit:intake.",
+              file=sys.stderr)
         return {}
+    if not isinstance(data, dict) or not data.get("jobs"):
+        print(f"WARNING: {MASTER} has no `jobs` list, so there is no experience to compare "
+              f"postings against. The skills and credential checks are OFF.", file=sys.stderr)
+        return {}
+    return data
 
 
 def scout(per_company=5, min_match=None, timeout=DEFAULT_TIMEOUT):
@@ -219,19 +237,21 @@ def scout(per_company=5, min_match=None, timeout=DEFAULT_TIMEOUT):
             a = qualification.assess(j["title"], jd, bank, profile)
             j["match"] = qualification.apply(base, a)
             j["why"] = why + a.reasons
+            if j.get("jd_error"):
+                j["why"].append(f"the posting would not load ({j['jd_error']})")
             j["fit"] = a.fit
         candidates.sort(key=lambda x: x["match"], reverse=True)
-        counts = {k: sum(1 for j in candidates if j.get("fit") == k)
-                  for k in (qualification.FIT, qualification.STRETCH, qualification.UNQUALIFIED)}
-        sources.append({"company": name, "ok": True, "total": len(jobs), "matched": len(kept),
-                        "assessed": len(candidates), "fit_counts": counts})
-
         top = candidates[:per_company]
-        # Every row the Jobs tab shows has been through the qualification pass.
-        # Carrying the un-fetched remainder of `kept` would put un-checked 99s
-        # back at the top of the table, which is the bug this whole pass exists
-        # to fix; `sources[].matched` still reports how many cleared min_match.
-        flat.extend(candidates)
+        counts = {k: sum(1 for j in top if j.get("fit") == k) for k in qualification.FITS}
+        sources.append({"company": name, "ok": True, "total": len(jobs), "matched": len(kept),
+                        "assessed": len(candidates), "reported": len(top), "fit_counts": counts})
+
+        # --per-company is a promise about the table, not just the console: the
+        # rows written here are the same rows the summary line above prints.
+        # Everything the qualification pass demoted stays out, and the wider
+        # candidate pool exists so there is something to promote in its place --
+        # but the pool itself is working memory, not output.
+        flat.extend(top)
         review.append({"name": name, "ats": ats, "token": token, "fit_counts": counts,
                        "jobs": [{k: j.get(k) for k in ("title", "location", "url", "id", "ats", "token",
                                                        "match", "why", "comp", "fit", "jd_text")} for j in top]})
@@ -239,8 +259,12 @@ def scout(per_company=5, min_match=None, timeout=DEFAULT_TIMEOUT):
     flat.sort(key=lambda x: x["match"], reverse=True)
     now = datetime.now(timezone.utc).isoformat()
     total_matched = sum(s.get("matched", 0) for s in sources if s.get("ok"))
+    total_assessed = sum(s.get("assessed", 0) for s in sources if s.get("ok"))
+    run_counts = {k: sum(1 for j in flat if j.get("fit") == k) for k in qualification.FITS}
+    unverified = run_counts[qualification.UNVERIFIED]
     json.dump({"generated": now, "search": search,
-               "sources": sources, "total_matched": total_matched, "assessed": len(flat),
+               "sources": sources, "total_matched": total_matched,
+               "assessed": total_assessed, "reported": len(flat), "fit_counts": run_counts,
                "shown": min(60, len(flat)),
                "jobs": [dict({k: j.get(k) for k in ("company", "title", "location",
                                                      "match", "why", "comp", "fit", "url")},
@@ -251,18 +275,29 @@ def scout(per_company=5, min_match=None, timeout=DEFAULT_TIMEOUT):
                         for j in flat[:60]],
                "note": (f"{total_matched} roles matched across "
                         f"{len([s for s in sources if s.get('ok')])} boards (Greenhouse + Ashby, "
-                        f"ToS-clean); the leading {len(flat)} were read in full and checked against "
-                        f"your experience bank"
-                        + ("" if bank else " (no experience bank yet, so only the level checks ran)")
+                        f"ToS-clean); {total_assessed} were read in full and checked against your "
+                        f"experience bank, and the best {len(flat)} are shown — "
+                        f"{run_counts[qualification.FIT]} fit, "
+                        f"{run_counts[qualification.STRETCH]} stretch, "
+                        f"{run_counts[qualification.UNQUALIFIED]} unqualified"
+                        + (f", {unverified} unverified (the posting stated nothing checkable)"
+                           if unverified else "")
+                        + ("" if bank else ". No experience bank yet, so only the level checks ran")
                         + ".")},
               open(JOBS_OUT, "w"), indent=2, default=str)
-    return {"sources": sources, "review": review, "flat": len(flat), "matched": total_matched}
+    return {"sources": sources, "review": review, "flat": len(flat), "matched": total_matched,
+            "fit_counts": run_counts}
 
 
 def _fit_summary(counts):
     c = counts or {}
-    return (f"fit {c.get(qualification.FIT, 0)} / stretch {c.get(qualification.STRETCH, 0)} "
-            f"/ unqualified {c.get(qualification.UNQUALIFIED, 0)}")
+    s = (f"fit {c.get(qualification.FIT, 0)} / stretch {c.get(qualification.STRETCH, 0)} "
+         f"/ unqualified {c.get(qualification.UNQUALIFIED, 0)}")
+    # Only printed when it happened, so a clean run stays readable -- but never
+    # hidden, because an unverified row is the one the user should not trust.
+    if c.get(qualification.UNVERIFIED):
+        s += f" / unverified {c[qualification.UNVERIFIED]}"
+    return s
 
 
 if __name__ == "__main__":
