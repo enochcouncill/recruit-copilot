@@ -20,6 +20,24 @@ Ask for, and write into `search`:
 - `keywords_bonus` - domain words that make a role more interesting.
 - `min_match` - the score below which a role is not worth showing. 55 is a sane start.
 
+Then ask for, and write into `search.profile` — this is who they ARE, as opposed to
+what they want, and it is what stops the scout ranking a VP job they cannot land
+above the manager job they can:
+- `years_experience` - **ask for this explicitly**: how many years of relevant
+  full-time experience they have since finishing school. A number. The scout compares
+  it against the years each posting states; within a year of the ask is a fit, two or
+  three over is a stretch, four or more sinks the role.
+- `education` - highest degree, in progress or finished (e.g. "MBA (expected 2027)").
+- `level_ceiling` - title words that sit above them today. Omit it to take the default
+  (director, vp, vice president, head of, principal, staff, distinguished, chief,
+  partner, gm, general manager), or set it to `[]` if none of those are a reach. Note
+  a word can mean two things: "Principal" is a reach in product and a mid-level title
+  in venture capital, so if they are searching VC, take it out.
+
+If they leave `profile` out entirely, the years and level checks are switched off
+rather than guessed — an inherited example profile would tell them they are qualified
+for roles they are not, in the tool's own confident voice.
+
 Also ask what they are actually trying to achieve and write those as `goals` rows
 (`goal`, `status`, optional `note`) so the dashboard tracks the search, not just the
 listings.

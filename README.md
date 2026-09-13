@@ -34,7 +34,17 @@ the same file the dashboard tracks, so the Jobs tab is your search rather than a
 
 **3. Scout.** Pulls open roles from public ATS boards (Greenhouse and Ashby JSON
 endpoints, no auth, ToS-clean), scores each against your goals, and shows its work.
-Every score comes with the reasons that produced it.
+Every score comes with the reasons that produced it. Then a second pass asks the
+question your goals file cannot answer — not "is this the kind of role I want?" but
+"could I actually get it?" — by reading each posting's stated requirements against
+the experience bank you confirmed at intake: the years it asks for versus the years
+you have, a title a level or two above you, a credential you do not hold, and how
+much of what it asks for appears anywhere in your bank. Each role comes back tagged
+**fit**, **stretch** or **unqualified**, with the sentence that earned the tag, so a
+Director role that wants twelve years stops outranking the job you can get on Monday.
+A posting it could not read, or that states nothing checkable, comes back
+**unverified** rather than fit — "I found no problem" and "I could not look" are
+different sentences, and only one of them should be reassuring.
 
 **4. Tailor.** For one posting it selects only the bullets that job asks for, picks
 the closest summary, and renders a single-column PDF. Then two gates run:
